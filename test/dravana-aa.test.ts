@@ -80,8 +80,12 @@ async function impersonateEntryPoint(entryPoint: string) {
   return ethers.provider.getSigner(entryPoint);
 }
 
-describe("DravanaAccount KYT + bridgeOut", () => {
-  let entryPoint: { address: string; getUserOpHash: (op: unknown) => Promise<string> };
+describe("Dravana-AA (account + paymaster)", () => {
+  let entryPoint: {
+    address: string;
+    getUserOpHash: (op: unknown) => Promise<string>;
+    getNonce: (a: string, n: number) => Promise<ethers.BigNumber>;
+  };
   let factory: { getAddress: (o: string, s: number) => Promise<string> };
   let account: { address: string; connect: (s: ethers.Signer) => { validateUserOp: (...a: unknown[]) => Promise<ethers.ContractTransaction> } };
   let bridge: { address: string; interface: ethers.utils.Interface };
@@ -116,10 +120,11 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     chainId = (await ethers.provider.getNetwork()).chainId;
   });
 
+  /** KYT binding.sender must equal EOA owner (INVALID_SENDER if account.address). */
   function buildBinding(overrides: Partial<KytBinding> = {}): KytBinding {
     const amount = ethers.utils.parseEther("1");
     return {
-      sender: account.address,
+      sender: owner.address,
       destination: recipient,
       destinationChain: chainId,
       amount,
@@ -149,7 +154,7 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     return { ...userOpStruct, signature };
   }
 
-  it("valid flow: validateUserOp succeeds", async () => {
+  it("1. valid flow: validateUserOp succeeds", async () => {
     const binding = buildBinding({ nonce: 1 });
     const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
     const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
@@ -158,12 +163,45 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     const userOpHash = await entryPoint.getUserOpHash(userOp);
     const epSigner = await impersonateEntryPoint(entryPoint.address);
     const tx = await account.connect(epSigner).validateUserOp(userOp, userOpHash, 0);
-    const receipt = await tx.wait();
-    expect(receipt.status).to.equal(1);
+    expect((await tx.wait()).status).to.equal(1);
   });
 
-  it("reverts DEST_MISMATCH when bridge recipient != binding.destination", async () => {
-    const binding = buildBinding({ nonce: 2 });
+  it("2. INVALID_SENDER when binding.sender != owner", async () => {
+    const binding = buildBinding({ nonce: 2, sender: account.address });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_SENDER");
+  });
+
+  it("3. CHAIN_MISMATCH when destinationChain != block.chainid", async () => {
+    const binding = buildBinding({ nonce: 3, destinationChain: 999999 });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("CHAIN_MISMATCH");
+  });
+
+  it("4. NONCE_USED on replay", async () => {
+    const binding = buildBinding({ nonce: 999 });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await account.connect(epSigner).validateUserOp(userOp, userOpHash, 0);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("NONCE_USED");
+  });
+
+  it("5. DEST_MISMATCH wrong bridge recipient", async () => {
+    const binding = buildBinding({ nonce: 5 });
     const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
     const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [
       ethers.Wallet.createRandom().address,
@@ -176,20 +214,8 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("DEST_MISMATCH");
   });
 
-  it("reverts NONCE_USED on replay", async () => {
-    const binding = buildBinding({ nonce: 999 });
-    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
-    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
-    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
-    const userOp = await buildUserOp(callData);
-    const userOpHash = await entryPoint.getUserOpHash(userOp);
-    const epSigner = await impersonateEntryPoint(entryPoint.address);
-    await account.connect(epSigner).validateUserOp(userOp, userOpHash, 0);
-    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("NONCE_USED");
-  });
-
-  it("reverts EXPIRED", async () => {
-    const binding = buildBinding({ expiry: Math.floor(Date.now() / 1000) - 10, nonce: 3 });
+  it("6. EXPIRED", async () => {
+    const binding = buildBinding({ expiry: Math.floor(Date.now() / 1000) - 10, nonce: 6 });
     const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
     const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
     const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
@@ -199,8 +225,8 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("EXPIRED");
   });
 
-  it("reverts INVALID_KYT with wrong signer", async () => {
-    const binding = buildBinding({ nonce: 4 });
+  it("7. INVALID_KYT wrong signer", async () => {
+    const binding = buildBinding({ nonce: 7 });
     const kytSig = await signKyt(wrongSigner, account.address, chainId, binding);
     const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
     const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
@@ -210,8 +236,8 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_KYT");
   });
 
-  it("reverts ONLY_BRIDGE_OUT for non-bridge selector", async () => {
-    const binding = buildBinding({ nonce: 5 });
+  it("8. ONLY_BRIDGE_OUT non-bridge selector", async () => {
+    const binding = buildBinding({ nonce: 8 });
     const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
     const bridgeOutCalldata = bridge.interface.encodeFunctionData("notBridgeOut", []);
     const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
@@ -219,5 +245,78 @@ describe("DravanaAccount KYT + bridgeOut", () => {
     const userOpHash = await entryPoint.getUserOpHash(userOp);
     const epSigner = await impersonateEntryPoint(entryPoint.address);
     await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("ONLY_BRIDGE_OUT");
+  });
+
+  it("9. INVALID_DEST zero destination", async () => {
+    const binding = buildBinding({ nonce: 9, destination: ethers.constants.AddressZero });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [recipient, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_DEST");
+  });
+
+  it("10. INVALID_AMOUNT zero amount", async () => {
+    const binding = buildBinding({ nonce: 10, amount: 0 });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, 0]);
+    const callData = encodeExecute(bridge.address, 0, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_AMOUNT");
+  });
+
+  it("11. paymaster: whitelisted sender passes validatePaymasterUserOp", async () => {
+    const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
+    const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
+    await pm.connect(owner).setWhitelisted(account.address, true);
+
+    const userOp = {
+      sender: account.address,
+      nonce: 0,
+      initCode: "0x",
+      callData: "0x",
+      callGasLimit: 100_000,
+      verificationGasLimit: 100_000,
+      preVerificationGas: 50_000,
+      maxFeePerGas: 1,
+      maxPriorityFeePerGas: 1,
+      paymasterAndData: ethers.utils.hexConcat([pm.address, "0x1234"]),
+      signature: "0x",
+    };
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    const ret = await pm.connect(epSigner).callStatic.validatePaymasterUserOp(
+      userOp,
+      ethers.constants.HashZero,
+      0
+    );
+    expect(ret.validationData).to.equal(0);
+  });
+
+  it("12. paymaster: non-whitelisted reverts NOT_SPONSORED", async () => {
+    const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
+    const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
+    await pm.connect(owner).setWhitelisted(account.address, false);
+
+    const userOp = {
+      sender: account.address,
+      nonce: 0,
+      initCode: "0x",
+      callData: "0x",
+      callGasLimit: 100_000,
+      verificationGasLimit: 100_000,
+      preVerificationGas: 50_000,
+      maxFeePerGas: 1,
+      maxPriorityFeePerGas: 1,
+      paymasterAndData: ethers.utils.hexConcat([pm.address, "0x"]),
+      signature: "0x",
+    };
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(
+      pm.connect(epSigner).callStatic.validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0)
+    ).to.be.revertedWith("NOT_SPONSORED");
   });
 });

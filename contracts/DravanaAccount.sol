@@ -116,6 +116,11 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
             bytes memory bridgeOutCalldata
         ) = abi.decode(cd[4:], (address, uint256, KytBinding, bytes, bytes));
 
+        require(binding.destination != address(0), "INVALID_DEST");
+        require(binding.amount > 0, "INVALID_AMOUNT");
+        require(binding.sender == owner, "INVALID_SENDER");
+        require(binding.destinationChain == block.chainid, "CHAIN_MISMATCH");
+
         require(_verifyKyt(binding, kytSig), "INVALID_KYT");
         require(!usedNonce[binding.nonce], "NONCE_USED");
         require(block.timestamp <= binding.expiry, "EXPIRED");
@@ -139,12 +144,26 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
         r = bytes4(r);
     }
 
-    function _sliceMem(bytes memory src, uint256 start, uint256 len) internal pure returns (bytes memory) {
-        bytes memory out = new bytes(len);
-        for (uint256 i = 0; i < len; i++) {
-            out[i] = src[start + i];
+    /// @dev Gas-optimized slice: full 32-byte words in assembly, remainder byte-wise (max 31).
+    function _sliceMem(bytes memory src, uint256 start, uint256 len) internal pure returns (bytes memory out) {
+        require(start + len <= src.length, "SLICE_OOB");
+        out = new bytes(len);
+        uint256 fullWords = len / 32;
+        uint256 rem = len % 32;
+        assembly {
+            let srcPos := add(add(src, 0x20), start)
+            let dstPos := add(out, 0x20)
+            let w := 0
+            for {} lt(w, fullWords) { w := add(w, 1) } {
+                mstore(add(dstPos, mul(w, 0x20)), mload(add(srcPos, mul(w, 0x20))))
+            }
         }
-        return out;
+        unchecked {
+            uint256 base = start + fullWords * 32;
+            for (uint256 i = 0; i < rem; i++) {
+                out[fullWords * 32 + i] = src[base + i];
+            }
+        }
     }
 
     function _verifyKyt(KytBinding memory binding, bytes memory signature) internal view returns (bool) {
