@@ -12,18 +12,29 @@ import "@openzeppelin/contracts/proxy/utils/UUPSUpgradeable.sol";
 
 import "./libraries/KytBindingLib.sol";
 
+interface IDravanaPolicyEngine {
+    function validateOpc(address destination, uint256 amount, address token) external view;
+}
+
 /**
- * @title DravanaAccount
- * @notice KYT-enforced ERC-4337 account: EIP-712 binding, single-use KYT nonce, bridgeOut-only execution.
+ * @title DravanaSmartWallet
+ * @notice Primary execution account with embedded policy enforcement
+ *
+ * @dev This contract is the only execution entry point (ERC-4337 account). It MUST validate
+ *      policy via `DravanaPolicyEngine` before it performs any bridge execution.
  */
-contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
+contract DravanaSmartWallet is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
     using ECDSA for bytes32;
 
     /// @notice Off-chain KYT signer (must match binding signature).
     address public immutable kytSigner;
 
+    /// @notice On-chain policy validation module.
+    address public immutable opcPolicyEngine;
+
     IEntryPoint private immutable _entryPoint;
 
+    /// NOTE: nonce is wallet-scoped since contract is per-user.
     /// @notice KYT binding nonces (strict single-use).
     mapping(uint256 => bool) public usedNonce;
 
@@ -41,25 +52,32 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
 
     /// @dev ABI: executeKytBridgeOut(address,uint256,(address,address,uint256,uint256,uint256,uint256),bytes,bytes)
     bytes4 public constant EXECUTE_KYT_BRIDGE_OUT_SELECTOR =
-        bytes4(keccak256("executeKytBridgeOut(address,uint256,(address,address,uint256,uint256,uint256,uint256),bytes,bytes)"));
+        bytes4(
+            keccak256(
+                "executeKytBridgeOut(address,uint256,(address,address,uint256,uint256,uint256,uint256),bytes,bytes)"
+            )
+        );
 
     address public owner;
 
-    event DravanaAccountInitialized(IEntryPoint indexed entryPoint, address indexed owner, address indexed kytSigner);
-
+    event DravanaSmartWalletInitialized(IEntryPoint indexed entryPoint, address indexed owner, address indexed kytSigner);
     event KytBridgeExecuted(uint256 indexed kytNonce, uint256 amount, bytes32 kytSigDigest);
 
-    constructor(IEntryPoint anEntryPoint, address _kytSigner) EIP712("DravanaNetraKYT", "1") {
+    constructor(IEntryPoint anEntryPoint, address _kytSigner, address _opcPolicyEngine) EIP712("DravanaNetraKYT", "1") {
         require(_kytSigner != address(0), "KYT_SIGNER_ZERO");
+        require(_opcPolicyEngine != address(0), "POLICY_ENGINE_ZERO");
+
         _entryPoint = anEntryPoint;
         kytSigner = _kytSigner;
+        opcPolicyEngine = _opcPolicyEngine;
+
         _disableInitializers();
     }
 
     function initialize(address anOwner) external initializer {
         require(anOwner != address(0), "OWNER_ZERO");
         owner = anOwner;
-        emit DravanaAccountInitialized(_entryPoint, anOwner, kytSigner);
+        emit DravanaSmartWalletInitialized(_entryPoint, anOwner, kytSigner);
     }
 
     /// @inheritdoc BaseAccount
@@ -68,7 +86,7 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
     }
 
     /**
-     * @notice ERC-4337 validation: KYT + bridge rules, then owner signature on `userOpHash`.
+     * @notice ERC-4337 validation: KYT + policy + bridge rules, then owner signature on `userOpHash`.
      */
     function validateUserOp(
         UserOperation calldata userOp,
@@ -94,6 +112,10 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
         bytes calldata bridgeOutCalldata
     ) external {
         _requireFromEntryPoint();
+
+        // Defense-in-depth: re-validate policy in execution too.
+        IDravanaPolicyEngine(opcPolicyEngine).validateOpc(binding.destination, amount, address(0));
+
         emit KytBridgeExecuted(binding.nonce, amount, keccak256(kytSignature));
         (bool success, bytes memory ret) = destination.call(bridgeOutCalldata);
         if (!success) {
@@ -116,14 +138,17 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
             bytes memory bridgeOutCalldata
         ) = abi.decode(cd[4:], (address, uint256, KytBinding, bytes, bytes));
 
-        require(binding.destination != address(0), "INVALID_DEST");
+        require(binding.sender != address(0), "INVALID_SENDER_ZERO");
+        require(binding.destination != address(0), "INVALID_DEST_ZERO");
         require(binding.amount > 0, "INVALID_AMOUNT");
+        require(binding.nonce != 0, "INVALID_NONCE");
         require(binding.sender == owner, "INVALID_SENDER");
         require(binding.destinationChain == block.chainid, "CHAIN_MISMATCH");
 
+        require(kytSig.length == 65, "INVALID_SIG_LEN");
         require(_verifyKyt(binding, kytSig), "INVALID_KYT");
         require(!usedNonce[binding.nonce], "NONCE_USED");
-        require(block.timestamp <= binding.expiry, "EXPIRED");
+        require(block.timestamp <= binding.expiry + 5, "EXPIRED");
         require(binding.amount == amount, "AMOUNT_MISMATCH");
         require(bridgeOutCalldata.length >= 4 + 64, "ONLY_BRIDGE_OUT");
         require(_readBytes4Mem(bridgeOutCalldata, 0) == BRIDGE_OUT_SELECTOR, "ONLY_BRIDGE_OUT");
@@ -132,6 +157,10 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
             abi.decode(_sliceMem(bridgeOutCalldata, 4, bridgeOutCalldata.length - 4), (address, uint256));
         require(recipient == binding.destination && bridgeAmount == binding.amount, "DEST_MISMATCH");
         require(bridge != address(0), "BRIDGE_ZERO");
+
+        // Policy enforcement BEFORE any bridge execution.
+        // Token is not derivable from this AA calldata; pass address(0) (matches OPC_SIMULATION "token not provided" behavior).
+        IDravanaPolicyEngine(opcPolicyEngine).validateOpc(binding.destination, binding.amount, address(0));
 
         usedNonce[binding.nonce] = true;
     }
@@ -201,3 +230,4 @@ contract DravanaAccount is BaseAccount, EIP712, Initializable, UUPSUpgradeable {
 
     receive() external payable {}
 }
+

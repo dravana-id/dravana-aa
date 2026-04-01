@@ -6,33 +6,33 @@ import "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 
-import "./DravanaAccount.sol";
+import "./DravanaSmartWallet.sol";
 
 /**
- * @title DravanaAccountFactory
- * @notice CREATE2 counterfactual deployment; implementation immutables include `kytSigner` for EIP-712 domain (`verifyingContract` = proxy).
+ * @title DravanaSmartWalletFactory
+ * @notice CREATE2 counterfactual deployment; implementation immutables include `kytSigner` and `opcPolicyEngine` for on-chain policy validation.
  */
-contract DravanaAccountFactory {
-    DravanaAccount public immutable accountImplementation;
+contract DravanaSmartWalletFactory {
+    DravanaSmartWallet public immutable smartWalletImplementation;
 
-    constructor(IEntryPoint entryPoint, address kytSigner) {
-        accountImplementation = new DravanaAccount(entryPoint, kytSigner);
+    constructor(IEntryPoint entryPoint, address kytSigner, address opcPolicyEngine) {
+        smartWalletImplementation = new DravanaSmartWallet(entryPoint, kytSigner, opcPolicyEngine);
     }
 
     /**
      * @notice Deploy account proxy or return existing. Address stable for `getAddress`.
      */
-    function createAccount(address anOwner, uint256 salt) public returns (DravanaAccount ret) {
+    function createAccount(address anOwner, uint256 salt) public returns (DravanaSmartWallet ret) {
         address addr = getAddress(anOwner, salt);
         uint256 codeSize = addr.code.length;
         if (codeSize > 0) {
-            return DravanaAccount(payable(addr));
+            return DravanaSmartWallet(payable(addr));
         }
-        ret = DravanaAccount(
+        ret = DravanaSmartWallet(
             payable(
                 new ERC1967Proxy{salt: bytes32(salt)}(
-                    address(accountImplementation),
-                    abi.encodeCall(DravanaAccount.initialize, (anOwner))
+                    address(smartWalletImplementation),
+                    abi.encodeCall(DravanaSmartWallet.initialize, (anOwner))
                 )
             )
         );
@@ -49,8 +49,8 @@ contract DravanaAccountFactory {
                     abi.encodePacked(
                         type(ERC1967Proxy).creationCode,
                         abi.encode(
-                            address(accountImplementation),
-                            abi.encodeCall(DravanaAccount.initialize, (anOwner))
+                            address(smartWalletImplementation),
+                            abi.encodeCall(DravanaSmartWallet.initialize, (anOwner))
                         )
                     )
                 )

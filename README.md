@@ -4,10 +4,11 @@ KYT-enforced ERC-4337 smart account (Dravana-AA): EIP-712 `DravanaNetraKYT` bind
 
 ## Layout
 
-- `contracts/DravanaAccount.sol` — account + validation
-- `contracts/DravanaAccountFactory.sol` — CREATE2 factory
+- `contracts/DravanaSmartWallet.sol` — account + embedded policy enforcement
+- `contracts/DravanaAccountFactory.sol` — CREATE2 factory (now exposes `DravanaSmartWalletFactory`)
 - `contracts/libraries/KytBindingLib.sol` — EIP-712 type hash
 - `contracts/interfaces/IBridgeOut.sol` — reference `bridgeOut` surface
+- `contracts/DravanaPolicyEngine.sol` — on-chain policy validation module
 - `contracts/mocks/MockBridge.sol` — tests
 
 ## Commands

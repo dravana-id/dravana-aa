@@ -95,6 +95,7 @@ describe("Dravana-AA (account + paymaster)", () => {
   let recipient: string;
   const salt = 42;
   let chainId: number;
+  let opcPolicyEngine: { address: string };
 
   beforeEach(async () => {
     recipient = ethers.Wallet.createRandom().address;
@@ -107,12 +108,15 @@ describe("Dravana-AA (account + paymaster)", () => {
     const EntryPointF = await ethers.getContractFactory("EntryPoint");
     entryPoint = (await EntryPointF.deploy()) as typeof entryPoint;
 
-    const FactoryF = await ethers.getContractFactory("DravanaAccountFactory");
-    factory = (await FactoryF.deploy(entryPoint.address, kytSigner.address)) as typeof factory;
+    const PolicyEngineF = await ethers.getContractFactory("DravanaPolicyEngine");
+    opcPolicyEngine = (await PolicyEngineF.deploy(ethers.constants.MaxUint256, [], [], [])) as typeof opcPolicyEngine;
+
+    const FactoryF = await ethers.getContractFactory("DravanaSmartWalletFactory");
+    factory = (await FactoryF.deploy(entryPoint.address, kytSigner.address, opcPolicyEngine.address)) as typeof factory;
 
     await factory.createAccount(owner.address, salt);
     const addr = await factory.getAddress(owner.address, salt);
-    account = (await ethers.getContractAt("DravanaAccount", addr)) as typeof account;
+    account = (await ethers.getContractAt("DravanaSmartWallet", addr)) as typeof account;
 
     const BridgeF = await ethers.getContractFactory("MockBridge");
     bridge = (await BridgeF.deploy()) as typeof bridge;
@@ -214,8 +218,8 @@ describe("Dravana-AA (account + paymaster)", () => {
     await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("DEST_MISMATCH");
   });
 
-  it("6. EXPIRED", async () => {
-    const binding = buildBinding({ expiry: Math.floor(Date.now() / 1000) - 10, nonce: 6 });
+  it("6. EXPIRED (past expiry + 5s grace)", async () => {
+    const binding = buildBinding({ expiry: Math.floor(Date.now() / 1000) - 20, nonce: 6 });
     const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
     const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
     const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
@@ -255,7 +259,7 @@ describe("Dravana-AA (account + paymaster)", () => {
     const userOp = await buildUserOp(callData);
     const userOpHash = await entryPoint.getUserOpHash(userOp);
     const epSigner = await impersonateEntryPoint(entryPoint.address);
-    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_DEST");
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_DEST_ZERO");
   });
 
   it("10. INVALID_AMOUNT zero amount", async () => {
@@ -269,54 +273,157 @@ describe("Dravana-AA (account + paymaster)", () => {
     await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_AMOUNT");
   });
 
-  it("11. paymaster: whitelisted sender passes validatePaymasterUserOp", async () => {
+  it("11. expiry grace: slightly past expiry still within +5s passes", async () => {
+    const block = await ethers.provider.getBlock("latest");
+    const ts = block.timestamp;
+    const binding = buildBinding({ expiry: ts - 2, nonce: 11 });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    const tx = await account.connect(epSigner).validateUserOp(userOp, userOpHash, 0);
+    expect((await tx.wait()).status).to.equal(1);
+  });
+
+  it("12. INVALID_SENDER_ZERO", async () => {
+    const binding = buildBinding({ nonce: 12, sender: ethers.constants.AddressZero });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [recipient, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith(
+      "INVALID_SENDER_ZERO"
+    );
+  });
+
+  it("13. INVALID_NONCE (zero)", async () => {
+    const binding = buildBinding({ nonce: 0 });
+    const kytSig = await signKyt(kytSigner, account.address, chainId, binding);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, kytSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_NONCE");
+  });
+
+  it("14. INVALID_SIG_LEN", async () => {
+    const binding = buildBinding({ nonce: 14 });
+    const badSig = "0x" + "00".repeat(64);
+    const bridgeOutCalldata = bridge.interface.encodeFunctionData("bridgeOut", [binding.destination, binding.amount]);
+    const callData = encodeExecute(bridge.address, binding.amount, binding, badSig, bridgeOutCalldata);
+    const userOp = await buildUserOp(callData);
+    const userOpHash = await entryPoint.getUserOpHash(userOp);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(account.connect(epSigner).validateUserOp(userOp, userOpHash, 0)).to.be.revertedWith("INVALID_SIG_LEN");
+  });
+
+  function buildPaymasterUserOp(pmAddress: string, overrides: Record<string, unknown> = {}) {
+    return {
+      sender: account.address,
+      nonce: 0,
+      initCode: "0x",
+      callData: "0x01",
+      callGasLimit: 100_000,
+      verificationGasLimit: 100_000,
+      preVerificationGas: 50_000,
+      maxFeePerGas: 1,
+      maxPriorityFeePerGas: 1,
+      paymasterAndData: ethers.utils.hexConcat([pmAddress, "0x1234"]),
+      signature: "0x",
+      ...overrides,
+    };
+  }
+
+  it("15. paymaster: whitelisted sender passes validatePaymasterUserOp", async () => {
     const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
     const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
     await pm.connect(owner).setWhitelisted(account.address, true);
 
-    const userOp = {
-      sender: account.address,
-      nonce: 0,
-      initCode: "0x",
-      callData: "0x",
-      callGasLimit: 100_000,
-      verificationGasLimit: 100_000,
-      preVerificationGas: 50_000,
-      maxFeePerGas: 1,
-      maxPriorityFeePerGas: 1,
-      paymasterAndData: ethers.utils.hexConcat([pm.address, "0x1234"]),
-      signature: "0x",
-    };
+    const userOp = buildPaymasterUserOp(pm.address);
     const epSigner = await impersonateEntryPoint(entryPoint.address);
-    const ret = await pm.connect(epSigner).callStatic.validatePaymasterUserOp(
-      userOp,
-      ethers.constants.HashZero,
-      0
-    );
+    const ret = await pm.connect(epSigner).callStatic.validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0);
     expect(ret.validationData).to.equal(0);
   });
 
-  it("12. paymaster: non-whitelisted reverts NOT_SPONSORED", async () => {
+  it("16. paymaster: non-whitelisted reverts NOT_SPONSORED", async () => {
     const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
     const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
     await pm.connect(owner).setWhitelisted(account.address, false);
 
-    const userOp = {
-      sender: account.address,
-      nonce: 0,
-      initCode: "0x",
-      callData: "0x",
-      callGasLimit: 100_000,
-      verificationGasLimit: 100_000,
-      preVerificationGas: 50_000,
-      maxFeePerGas: 1,
-      maxPriorityFeePerGas: 1,
-      paymasterAndData: ethers.utils.hexConcat([pm.address, "0x"]),
-      signature: "0x",
-    };
+    const userOp = buildPaymasterUserOp(pm.address);
     const epSigner = await impersonateEntryPoint(entryPoint.address);
     await expect(
       pm.connect(epSigner).callStatic.validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0)
     ).to.be.revertedWith("NOT_SPONSORED");
+  });
+
+  it("17. paymaster: GAS_TOO_LOW", async () => {
+    const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
+    const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
+    await pm.connect(owner).setWhitelisted(account.address, true);
+
+    const userOp = buildPaymasterUserOp(pm.address, { callGasLimit: 21000 });
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(
+      pm.connect(epSigner).callStatic.validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0)
+    ).to.be.revertedWith("GAS_TOO_LOW");
+  });
+
+  it("17b. paymaster: VERIFY_GAS_TOO_LOW", async () => {
+    const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
+    const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
+    await pm.connect(owner).setWhitelisted(account.address, true);
+
+    const userOp = buildPaymasterUserOp(pm.address, { verificationGasLimit: 21000 });
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await expect(
+      pm.connect(epSigner).callStatic.validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0)
+    ).to.be.revertedWith("VERIFY_GAS_TOO_LOW");
+  });
+
+  it("18. paymaster: RATE_LIMIT on immediate second sponsorship", async () => {
+    const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
+    const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
+    await pm.connect(owner).setWhitelisted(account.address, true);
+
+    const userOp = buildPaymasterUserOp(pm.address);
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    await (await pm.connect(epSigner).validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0)).wait();
+    await expect(
+      pm.connect(epSigner).validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0)
+    ).to.be.revertedWith("RATE_LIMIT");
+
+    await network.provider.send("evm_increaseTime", [6]);
+    await network.provider.send("evm_mine", []);
+    const ret = await pm.connect(epSigner).callStatic.validatePaymasterUserOp(userOp, ethers.constants.HashZero, 0);
+    expect(ret.validationData).to.equal(0);
+  });
+
+  it("19. paymaster: sponsor signature approves when not whitelisted", async () => {
+    const sponsor = ethers.Wallet.createRandom().connect(ethers.provider);
+    await network.provider.send("hardhat_setBalance", [sponsor.address, ethers.utils.parseEther("1").toHexString()]);
+
+    const PaymasterF = await ethers.getContractFactory("DravanaPaymaster");
+    const pm = await PaymasterF.deploy(entryPoint.address, owner.address);
+    await pm.connect(owner).setWhitelisted(account.address, false);
+    await pm.connect(owner).setSponsorSigner(sponsor.address);
+
+    const userOp = buildPaymasterUserOp(pm.address);
+    const userOpHash = ethers.utils.keccak256("0xabcd");
+    const sponsorSig = await sponsor.signMessage(ethers.utils.arrayify(userOpHash));
+    const paymasterAndData = ethers.utils.hexConcat([pm.address, sponsorSig]);
+
+    const epSigner = await impersonateEntryPoint(entryPoint.address);
+    const ret = await pm.connect(epSigner).callStatic.validatePaymasterUserOp(
+      { ...userOp, paymasterAndData },
+      userOpHash,
+      0
+    );
+    expect(ret.validationData).to.equal(0);
   });
 });
